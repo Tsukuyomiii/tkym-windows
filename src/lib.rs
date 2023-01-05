@@ -89,7 +89,6 @@ pub struct Mouse {
     pub pos: Point,
     // Buttons
     pub left: bool,
-
     pub right: bool,
 }
 
