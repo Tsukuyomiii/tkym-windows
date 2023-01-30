@@ -1,6 +1,16 @@
+//! ```
+//! 
+//! let platform = Platform::init();
+//! let window = Platform.create_window();
+//! loop {
+//!     window.process_messages();
+//!     // ...
+//! }
+//! ```
+
 use windows::{ core::*, s, Win32::{ Foundation::*, Graphics::Gdi::*, System::LibraryLoader::*, UI::WindowsAndMessaging::*, }, };
 
-use common::geo::{Point, Rect2};
+use common::geo::{Vector2, Rect2};
 
 pub static mut WINDOW_LIST: WindowList = WindowList::new();
 
@@ -12,8 +22,8 @@ fn instance_handle() -> HINSTANCE {
 
 #[derive(Debug)]
 pub struct Window {
-    pub handle: HWND,
-    pub state: State,
+    handle:     HWND,
+    pub state:      State,
     device_context: HDC,
 }
 
@@ -32,27 +42,27 @@ impl Window {
         }
     }
 
-    pub fn swap_buffers(&self, buffer: *const u8) {
+    pub fn swap_buffers<T: Into<*const u8>>(&self, buffer: T) {
         let Rect2 { width, height } = self.state.size;
         unsafe {
             StretchDIBits(
                 self.device_context,
                 0,
                 0,
-                width as i32,
+                width  as i32,
                 height as i32,
                 0,
                 0,
-                width as i32,
+                width  as i32,
                 height as i32,
-                Some(buffer.cast()),
+                Some(buffer.into().cast()),
                 &BITMAPINFO {
                     bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: width as i32,
-                        biHeight: -(height as i32),
-                        biPlanes: 1,
-                        biBitCount: 32,
+                        biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth:       width as i32,
+                        biHeight:      -(height as i32),
+                        biPlanes:      1,
+                        biBitCount:    32,
                         biCompression: BI_RGB,
                         ..Default::default()
                     },
@@ -65,20 +75,22 @@ impl Window {
     }
 }
 
-/// State for windows to be passed into and managed by the window procedure.
-#[derive(Debug)]
+/// State for windows, to be managed by the window procedure.
+#[derive(Debug, Copy, Clone)]
 pub struct State {
+    pub minimized: bool,
     /// Details of the mouse, as last captured by the window.
     pub mouse: Mouse,
     /// The current size of the window.
-    pub size: Rect2,
+    pub size:  Rect2,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
+            minimized: false,
             mouse: Mouse::default(),
-            size: Rect2::new(900, 600)
+            size:  Rect2::new(900, 600)
         }
     }
 }
@@ -86,17 +98,17 @@ impl Default for State {
 #[derive(Debug, Copy, Clone)]
 pub struct Mouse {
     /// The current mouse position in window coordinates.
-    pub pos: Point,
+    pub pos:   Vector2,
     // Buttons
-    pub left: bool,
+    pub left:  bool,
     pub right: bool,
 }
 
 impl Default for Mouse {
     fn default() -> Self {
         Self {
-            pos: Point::new(0,0),
-            left: false,
+            pos:   Vector2::new(0,0),
+            left:  false,
             right: false,
         }
     }
@@ -112,12 +124,12 @@ impl Platform {
         let handle = instance_handle();
         unsafe {
             RegisterClassA(&WNDCLASSA {
-                style: CS_HREDRAW | CS_HREDRAW | CS_OWNDC, 
-                hInstance: handle,
-                hCursor: HCURSOR(0),
-                hIcon: HICON(0),
+                style:         CS_HREDRAW | CS_HREDRAW | CS_OWNDC, 
+                hInstance:     handle,
+                hCursor:       HCURSOR(0),
+                hIcon:         HICON(0),
                 lpszClassName: CLASS_NAME,
-                lpfnWndProc: Some(window_proc),
+                lpfnWndProc:   Some(window_proc),
                 ..Default::default()
             });
         }
@@ -181,7 +193,8 @@ impl WindowList {
     }
 }
 
-/// Interface for user to interact with created windows.
+/// Interface for consumer to interact with created windows.
+#[derive(Debug, Copy, Clone)]
 pub struct WindowHandle(HWND);
 
 impl std::ops::Deref for WindowHandle {
@@ -204,23 +217,24 @@ impl From<HWND> for WindowHandle {
 
 unsafe extern "system" fn window_proc(
     win_handle: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
+    message:    u32,
+    wparam:     WPARAM,
+    lparam:     LPARAM,
 ) -> LRESULT {
     let mut result = LRESULT(0);
     match message {
         WM_MOUSEMOVE => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
+            use std::mem::transmute;
             // optimize: would reading off a raw pointer be faster than byte splitting?
             let lparam_bytes = lparam.0.to_le_bytes();
-            let x = std::mem::transmute::<[u8; 2], u16>([lparam_bytes[0], lparam_bytes[1]]);
-            let y = std::mem::transmute::<[u8; 2], u16>([lparam_bytes[2], lparam_bytes[3]]);
-            window.state.mouse.pos = Point::new(x as u32, y as u32);
+            let x = transmute::<[u8; 2], u16>([lparam_bytes[0], lparam_bytes[1]]);
+            let y = transmute::<[u8; 2], u16>([lparam_bytes[2], lparam_bytes[3]]);
+            window.state.mouse.pos = Vector2::new(x as u32, y as u32);
         }
         WM_SIZE => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
             let mut rect = RECT::default();
             GetClientRect(win_handle, &mut rect);
-            let width = rect.right as u32;
+            let width  = rect.right  as u32;
             let height = rect.bottom as u32;
             window.state.size = Rect2::new(width,height);
         }
@@ -228,6 +242,17 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP   => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.left  = false },
         WM_RBUTTONDOWN => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.right = true },
         WM_RBUTTONUP   => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.right = false },
+        WM_SHOWWINDOW => {
+            if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
+                if wparam.0 == 0 {
+                    window.state.minimized = true;
+                    println!("Minimizing")
+                } else {
+                    window.state.minimized = false;
+                    println!("Maximizing")
+                }
+            }
+        }
         _ => result = DefWindowProcA(win_handle, message, wparam, lparam),
     }
     result
