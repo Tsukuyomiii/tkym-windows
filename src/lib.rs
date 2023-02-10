@@ -1,5 +1,7 @@
+#![feature(let_chains)]
+
 //! ```
-//! 
+//! use tkym_windows::Platform;
 //! let platform = Platform::init();
 //! let window = Platform.create_window();
 //! loop {
@@ -7,12 +9,12 @@
 //!     // ...
 //! }
 //! ```
-
-use windows::{ core::*, s, Win32::{ Foundation::*, Graphics::Gdi::*, System::LibraryLoader::*, UI::WindowsAndMessaging::*, }, };
+use std::cell::RefCell;
+use std::{collections::HashMap};
+use std::pin::Pin;
+use windows::{core::*, s, Win32::{Foundation::*, Graphics::Gdi::*, System::LibraryLoader::*, UI::WindowsAndMessaging::*, }, };
 
 use common::geo::{Vector2, Rect2};
-
-pub static mut WINDOW_LIST: WindowList = WindowList::new();
 
 const CLASS_NAME: PCSTR = s!("RGUIWC");
 
@@ -20,16 +22,27 @@ fn instance_handle() -> HINSTANCE {
     unsafe { GetModuleHandleA(None).unwrap() }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Window {
-    handle:     HWND,
-    pub state:      State,
+    handle:         HWND,
     device_context: HDC,
+    pub minimized: bool,
+    /// Details of the mouse, as last captured by the window.
+    pub mouse: Mouse,
+    /// The current size of the window.
+    pub size:  Rect2,
+    
 }
 
 impl Window {
-    pub fn new(handle: HWND, state: State) -> Self {
-        Self { handle, state, device_context: unsafe { GetDC(handle) } }
+    pub fn new(handle: HWND) -> Self {
+        Self { 
+            handle, 
+            minimized: false, 
+            mouse: Mouse::default(), 
+            size:  Rect2::new(900, 600), 
+            device_context: unsafe { GetDC(handle) }
+        }
     }
 
     pub fn process_messages(&self) {
@@ -43,7 +56,7 @@ impl Window {
     }
 
     pub fn swap_buffers<T: Into<*const u8>>(&self, buffer: T) {
-        let Rect2 { width, height } = self.state.size;
+        let Rect2 { width, height } = self.size;
         unsafe {
             StretchDIBits(
                 self.device_context,
@@ -78,21 +91,7 @@ impl Window {
 /// State for windows, to be managed by the window procedure.
 #[derive(Debug, Copy, Clone)]
 pub struct State {
-    pub minimized: bool,
-    /// Details of the mouse, as last captured by the window.
-    pub mouse: Mouse,
-    /// The current size of the window.
-    pub size:  Rect2,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            minimized: false,
-            mouse: Mouse::default(),
-            size:  Rect2::new(900, 600)
-        }
-    }
+    
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -117,6 +116,7 @@ impl Default for Mouse {
 #[derive(Debug)]
 pub struct Platform {
     pub handle: HINSTANCE,
+    pub windows: Pin<Box<RefCell<WindowMap>>>
 }
 
 impl Platform {
@@ -132,13 +132,13 @@ impl Platform {
                 lpfnWndProc:   Some(window_proc),
                 ..Default::default()
             });
-        }
-        Self { handle }
+        };
+        let windows = Box::pin(RefCell::new(HashMap::new()));
+        Self { handle, windows }
     }
 
     pub fn create_window(&self) -> WindowHandle {
         let window_name = s!("Rust GUI");
-        let state = State::default();
         let win_handle = unsafe {
             CreateWindowExA(
                 WINDOW_EX_STYLE(0),
@@ -147,73 +147,100 @@ impl Platform {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                state.size.width  as i32,
-                state.size.height as i32,
+                900_i32,
+                600_i32,
                 HWND(0),
                 HMENU(0),
                 self.handle,
-                None,
+                Some((self.windows.as_ref().get_ref() as *const RefCell<WindowMap>).cast()),
             )
         };
-        let window_state = Window::new(win_handle, state);
-        unsafe {
-            WINDOW_LIST.0.push(window_state);
-        };
-        WindowHandle(win_handle)
-    }
-}
+        let window = Window::new(win_handle);
 
-#[derive(Debug)]
-pub struct WindowList(pub Vec<Window>);
-
-impl WindowList {
-    pub const fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    #[allow(dead_code)]
-    pub fn get_state<'a, T: Into<HWND> + Copy>(&'a self, handle: T) -> Option<&'a Window> {
-        let mut result = None;
-        for window in &self.0 {
-            if window.handle.0 == handle.into().0 {
-                result = Some(window);
-            }
-        };
-        result
-    }
-
-    pub fn get_state_mut<'a, T: Into<HWND> + Copy>(&'a mut self, handle: T) -> Option<&'a mut Window> {
-        let mut result = None;
-        for window in &mut self.0 {
-            if window.handle.0 == handle.into().0 {
-                result = Some(window);
-            }
-        };
-        result
+        (*self.windows).borrow_mut().insert(window.handle.0, window);
+        WindowHandle(win_handle, &self)
     }
 }
 
 /// Interface for consumer to interact with created windows.
-#[derive(Debug, Copy, Clone)]
-pub struct WindowHandle(HWND);
+#[derive(Debug)]
+pub struct WindowHandle<'p>(HWND, &'p Platform);
 
-impl std::ops::Deref for WindowHandle {
-    type Target = Window;
-    fn deref(&self) -> &Self::Target {
-        for window in unsafe { &WINDOW_LIST.0 } {
-            if window.handle.0 == self.0.0 {
-                return window;
+impl<'p> WindowHandle<'p> {
+    pub fn state(&self) -> Window {
+        *(self.1).windows.borrow().get(&self.0.0).unwrap()
+    }
+}
+
+type WindowMap = HashMap<isize, Window>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProcArgs {
+    win_handle: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+}
+
+mod subprocedures {
+    use super::*;
+    pub(crate) fn wm_create(args: ProcArgs) {
+        let ProcArgs { win_handle, lparam, .. } = args;
+        if let Some(state) = unsafe { (lparam.0 as *const CREATESTRUCTA).as_ref() } {
+            println!("{state:?}");
+            let list_ptr = state.lpCreateParams as isize as *const RefCell<WindowMap>;
+            if let Some(state) = unsafe { list_ptr.as_ref() } && let Ok(mut window_list) = state.try_borrow_mut() {
+                (*window_list).insert(win_handle.0, Window::new(win_handle));
             }
+            unsafe {
+                SetPropA(win_handle, s!("window_list"), windows::Win32::Foundation::HANDLE(state.lpCreateParams as isize));
+            }
+            // SetWindowPos(win_handle, None, 0 ,0 ,0 , 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOMOVE | SWP_FRAMECHANGED);
         }
-        panic!("Deref<Window> for WindowHandle failed!");
+    }
+
+    pub(crate) fn wm_mouse_move(window: &mut Window, args: ProcArgs) {
+        let ProcArgs { win_handle, lparam, .. } = args;
+        use std::mem::transmute;
+        // optimize: would reading off a raw pointer be faster than byte splitting?
+        let lparam_bytes = lparam.0.to_le_bytes();
+        let (x,y) = unsafe {
+            (
+                transmute::<[u8; 2], u16>([lparam_bytes[0], lparam_bytes[1]]),
+                transmute::<[u8; 2], u16>([lparam_bytes[2], lparam_bytes[3]])
+            )
+        };
+        window.mouse.pos = Vector2::new(x as u32, y as u32);
+    }
+
+    pub(crate) fn wm_size(window: &mut Window, args: ProcArgs) {
+        let ProcArgs { win_handle, .. } = args;
+        let mut rect = RECT::default();
+        unsafe {
+            GetClientRect(win_handle, &mut rect);
+        }
+        let width  = rect.right  as u32;
+        let height = rect.bottom as u32;
+        window.size = Rect2::new(width,height);
+    }
+
+    pub(crate) fn wm_l_button_down(window: &mut Window, args: ProcArgs) {
+        window.mouse.left = true;
+    }
+
+    pub(crate) fn wm_l_button_up(window: &mut Window, args: ProcArgs) {
+        window.mouse.left = false;
+    }
+
+    pub(crate) fn wm_r_button_down(window: &mut Window, args: ProcArgs) {
+        window.mouse.right = true;
+    }
+
+    pub(crate) fn wm_r_button_up(window: &mut Window, args: ProcArgs) {
+        window.mouse.right = false;
     }
 }
 
-impl From<HWND> for WindowHandle {
-    fn from(value: HWND) -> Self {
-        Self(value)
-    }
-}
 
 unsafe extern "system" fn window_proc(
     win_handle: HWND,
@@ -222,37 +249,35 @@ unsafe extern "system" fn window_proc(
     lparam:     LPARAM,
 ) -> LRESULT {
     let mut result = LRESULT(0);
+
+    let args = ProcArgs {
+        win_handle,
+        message,
+        wparam,
+        lparam
+    };
+
+    let do_subproc_mut = move |subproc: fn(&mut Window, ProcArgs)| unsafe {
+        let prop = GetPropA(win_handle, s!("window_list"));
+        let ptr = prop.0 as *const RefCell<WindowMap>;
+        if prop.0 != 0 
+        && let Some(state) = ptr.as_ref() 
+        && let Ok(mut window_list) = state.try_borrow_mut()
+        && let Some(window) = window_list.get_mut(&win_handle.0) {
+            subproc(window, args); 
+        } else {
+            panic!("modify_window_state failed!");
+        }
+    };
+
     match message {
-        WM_MOUSEMOVE => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
-            use std::mem::transmute;
-            // optimize: would reading off a raw pointer be faster than byte splitting?
-            let lparam_bytes = lparam.0.to_le_bytes();
-            let x = transmute::<[u8; 2], u16>([lparam_bytes[0], lparam_bytes[1]]);
-            let y = transmute::<[u8; 2], u16>([lparam_bytes[2], lparam_bytes[3]]);
-            window.state.mouse.pos = Vector2::new(x as u32, y as u32);
-        }
-        WM_SIZE => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
-            let mut rect = RECT::default();
-            GetClientRect(win_handle, &mut rect);
-            let width  = rect.right  as u32;
-            let height = rect.bottom as u32;
-            window.state.size = Rect2::new(width,height);
-        }
-        WM_LBUTTONDOWN => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.left  = true },
-        WM_LBUTTONUP   => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.left  = false },
-        WM_RBUTTONDOWN => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.right = true },
-        WM_RBUTTONUP   => if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) { window.state.mouse.right = false },
-        WM_SHOWWINDOW => {
-            if let Some(window) = WINDOW_LIST.get_state_mut(win_handle) {
-                if wparam.0 == 0 {
-                    window.state.minimized = true;
-                    println!("Minimizing")
-                } else {
-                    window.state.minimized = false;
-                    println!("Maximizing")
-                }
-            }
-        }
+        WM_CREATE      => subprocedures::wm_create(args),
+        WM_MOUSEMOVE   => do_subproc_mut(subprocedures::wm_mouse_move),
+        WM_SIZE        => do_subproc_mut(subprocedures::wm_size),
+        WM_LBUTTONDOWN => do_subproc_mut(subprocedures::wm_l_button_down),
+        WM_LBUTTONUP   => do_subproc_mut(subprocedures::wm_l_button_up),
+        WM_RBUTTONDOWN => do_subproc_mut(subprocedures::wm_r_button_down),
+        WM_RBUTTONUP   => do_subproc_mut(subprocedures::wm_r_button_up),
         _ => result = DefWindowProcA(win_handle, message, wparam, lparam),
     }
     result
